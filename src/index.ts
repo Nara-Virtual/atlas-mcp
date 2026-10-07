@@ -7,15 +7,34 @@ import { loadConfig } from "./config.js";
 import { AtlasClient } from "./client.js";
 
 /** Thin local bridge — tool catalog and handlers live on the Atlas server (auto-sync on every connect). */
-export const CLIENT_VERSION = "0.4.3";
+export const CLIENT_VERSION = "0.6.0";
 
 const dynamicInput = z.object({}).passthrough();
-const NO_PROJECT_DEFAULT = new Set(["atlas_whoami", "atlas_list_projects", "atlas_create_project", "atlas_log_work"]);
+// these span every project the key reaches (task tools take the project from the task itself)
+const NO_PROJECT_DEFAULT = new Set([
+  "atlas_whoami",
+  "atlas_list_projects",
+  "atlas_create_project",
+  "atlas_log_work",
+  "atlas_my_tasks",
+  "atlas_deployments",
+  "atlas_deploy_action",
+  "atlas_dokploy_api_search",
+  "atlas_dokploy_api_call",
+  "atlas_chat_send",
+]);
 
 type McpManifest = {
   version: string;
   instructions: string;
-  tools: { name: string; description: string; inputSchema: Record<string, unknown> }[];
+  tools: {
+    name: string;
+    title?: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+    /** read-only / destructive hints so clients can auto-approve reads */
+    annotations?: { title?: string; readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
+  }[];
 };
 
 function log(m: string) {
@@ -29,10 +48,12 @@ async function readLocalFile(repoRoot: string, localPath: string): Promise<strin
   return readFile(abs, "utf-8");
 }
 
-function withDefaultProject(args: Record<string, unknown>, boundRef: string | undefined, toolName: string) {
+/** The bound project (.atlas / the key's first) for every tool that takes one and wasn't given one — e.g. atlas_uptime check=. */
+export function withDefaultProject(args: Record<string, unknown>, boundRef: string | undefined, toolName: string) {
   if (!boundRef || NO_PROJECT_DEFAULT.has(toolName)) return args;
+  if (typeof args.project === "string" && args.project.trim()) return args;
   if (typeof args.projectId === "string" && args.projectId.trim()) return args;
-  return { ...args, projectId: boundRef };
+  return { ...args, project: boundRef };
 }
 
 async function resolveLocalPath(
@@ -48,21 +69,23 @@ async function resolveLocalPath(
   return { ...rest, content };
 }
 
+/** The text, then any images as image content (the agent sees them). Keep in sync with mcpContent in the server's format.ts. */
 function toMcpContent(result: unknown) {
+  let text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
   if (result && typeof result === "object" && "format" in result && "body" in result) {
     const r = result as { format: string; body: string; meta?: Record<string, unknown> };
-    const footer = r.meta ? `\n\n---\n${JSON.stringify(r.meta)}` : "";
-    return { content: [{ type: "text" as const, text: `${r.body}${footer}` }] };
+    text = `${r.body}${r.meta ? `\n\n---\n${JSON.stringify(r.meta)}` : ""}`;
   }
+  const images = (result as { images?: { data: string; mimeType: string }[] } | null)?.images ?? [];
   return {
-    content: [{ type: "text" as const, text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }],
+    content: [{ type: "text" as const, text }, ...images.map((i) => ({ type: "image" as const, data: i.data, mimeType: i.mimeType }))],
   };
 }
 
 export async function runServer() {
   const { baseUrl, apiKey, config, cwd } = loadConfig();
   if (!apiKey) {
-    log("No ATLAS_MCP_KEY set. Run: npx -y github:TheDivyanshShukla/atlas-mcp install --key atlas_mcp_…");
+    log("No ATLAS_MCP_KEY set. Run: npx -y github:Nara-Virtual/atlas-mcp install --key atlas_mcp_…");
     process.exit(1);
   }
   const client = new AtlasClient(baseUrl, apiKey);
@@ -100,7 +123,7 @@ export async function runServer() {
   for (const tool of manifest.tools) {
     server.registerTool(
       tool.name,
-      { description: tool.description, inputSchema: dynamicInput },
+      { title: tool.title, description: tool.description, inputSchema: dynamicInput, annotations: tool.annotations },
       async (args) => {
         try {
           let resolved = withDefaultProject(args as Record<string, unknown>, boundRef, tool.name);

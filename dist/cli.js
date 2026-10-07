@@ -6,6 +6,8 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { runServer } from "./index.js";
 import { loadConfig, DEFAULT_TOOLSETS, globalConfigPath } from "./config.js";
+import { envCli, logCli, ENV_HELP } from "./env.js";
+import { syncCli, SYNC_HELP } from "./sync.js";
 function out(m) {
     process.stderr.write(m + "\n");
 }
@@ -25,8 +27,8 @@ function writeJson(p, data) {
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, JSON.stringify(data, null, 2) + "\n");
 }
-// Install once globally: bun install -g github:TheDivyanshShukla/atlas-mcp#main
-export const GITHUB_REPO = "TheDivyanshShukla/atlas-mcp";
+// Install once globally: bun install -g github:Nara-Virtual/atlas-mcp#main
+export const GITHUB_REPO = "Nara-Virtual/atlas-mcp";
 export const GITHUB_PKG = `github:${GITHUB_REPO}`;
 /** Pin to main so npx/bun always resolve the latest commit (not a stale lock). */
 export const GITHUB_PKG_LATEST = `${GITHUB_PKG}#main`;
@@ -345,6 +347,8 @@ function showHelp() {
     out(`  npx -y ${GITHUB_PKG_LATEST} update   same, without a prior global install`);
     out(`  atlas hooks install     Claude Code auto-capture hooks (per repo)`);
     out(`  atlas serve             stdio MCP server (IDEs spawn via npx)\n`);
+    out(ENV_HELP + "\n");
+    out(SYNC_HELP + "\n");
 }
 (async () => {
     // `atlas .` or `atlas init` → scaffold .atlas + agent configs in the current folder
@@ -364,6 +368,12 @@ function showHelp() {
         hooksInstall();
     else if (cmd === "hook")
         await hook(process.argv[3] ?? "stop");
+    else if (cmd === "env")
+        await envCli(process.argv.slice(3));
+    else if (cmd === "log")
+        await logCli(process.argv.slice(3));
+    else if (cmd === "sync")
+        await syncCli(process.argv.slice(3));
     else if (shouldRunServer())
         await runServer();
     else if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h")
