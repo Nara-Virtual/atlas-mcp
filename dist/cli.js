@@ -9,12 +9,12 @@ import { envCli, logCli, ENV_HELP } from "./env.js";
 import { syncCli, SYNC_HELP } from "./sync.js";
 import { GITHUB_PKG_LATEST, installTarget, removeTarget, stdioEntry, targets } from "./clients.js";
 import { doctor } from "./doctor.js";
+import { argValue } from "./args.js";
 function out(m) {
     process.stderr.write(m + "\n");
 }
 function arg(name) {
-    const i = process.argv.indexOf(`--${name}`);
-    return i >= 0 ? process.argv[i + 1] : undefined;
+    return argValue(process.argv, name);
 }
 function readJson(p) {
     try {
