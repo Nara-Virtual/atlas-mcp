@@ -44,7 +44,11 @@ export async function doctor(): Promise<number> {
     try {
       const m = await client.get<McpManifest>("/api/v1/mcp/manifest", { cache: false });
       say(true, `Tools: ${m.tools.length} (server MCP v${m.version})`);
-      if (m.version.split(".").slice(0, 2).join(".") !== CLIENT_VERSION.split(".").slice(0, 2).join(".")) say("warn", `Client v${CLIENT_VERSION} and server v${m.version} differ — run \`atlas update\` if tools look wrong.`);
+      // the server's number is its tool surface, versioned apart from this client: only an OLDER client is worth a warning
+      const mm = (v: string) => v.split(".").slice(0, 2).map(Number) as [number, number];
+      const [sa, sb] = mm(m.version);
+      const [ca, cb] = mm(CLIENT_VERSION);
+      if (ca < sa || (ca === sa && cb < sb)) say("warn", `This client (v${CLIENT_VERSION}) is older than the server (v${m.version}) — run \`atlas update\`.`);
     } catch (e) {
       say(false, `Tool manifest: ${(e as Error).message}`);
     }
