@@ -8,6 +8,8 @@ import { runServer } from "./index.js";
 import { loadConfig, DEFAULT_TOOLSETS, globalConfigPath, type AtlasConfig } from "./config.js";
 import { envCli, logCli, ENV_HELP } from "./env.js";
 import { syncCli, SYNC_HELP } from "./sync.js";
+import { GITHUB_PKG_LATEST, installTarget, removeTarget, stdioEntry, targets } from "./clients.js";
+import { doctor } from "./doctor.js";
 
 function out(m: string) {
   process.stderr.write(m + "\n");
@@ -32,7 +34,7 @@ function writeJson(p: string, data: unknown) {
 export const GITHUB_REPO = "Nara-Virtual/atlas-mcp";
 export const GITHUB_PKG = `github:${GITHUB_REPO}`;
 /** Pin to main so npx/bun always resolve the latest commit (not a stale lock). */
-export const GITHUB_PKG_LATEST = `${GITHUB_PKG}#main`;
+export { GITHUB_PKG_LATEST };
 
 function run(cmd: string) {
   execSync(cmd, {
@@ -67,86 +69,39 @@ export function selfUpdate() {
   out(`\n✓ Updated. Restart Cursor / Claude Code MCP, or reload the window.\n`);
 }
 
-/** Stdio MCP entry for IDEs. npx = zero global install; atlas = faster cold start if on PATH. */
-export function stdioMcpEntry(baseUrl: string, token = "${ATLAS_MCP_KEY}", via: "npx" | "global" = "npx") {
-  const env = { ATLAS_MCP_KEY: token, ATLAS_BASE_URL: baseUrl };
-  if (via === "global") return { command: "atlas", args: [] as string[], env };
-  return { command: "npx", args: ["-y", GITHUB_PKG_LATEST], env };
-}
-
-function vscodeUserMcpPath(variant: "Code" | "Code - Insiders" = "Code"): string {
-  const home = homedir();
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || join(home, "AppData", "Roaming");
-    return join(appData, variant, "User", "mcp.json");
-  }
-  if (process.platform === "darwin") {
-    return join(home, "Library", "Application Support", variant, "User", "mcp.json");
-  }
-  return join(home, ".config", variant, "User", "mcp.json");
-}
-
-/** VS Code mcp.json uses `servers` + explicit stdio type. */
-function vscodeMcpEntry(baseUrl: string, token: string) {
-  const { command, args, env } = stdioMcpEntry(baseUrl, token, "npx");
-  return { type: "stdio" as const, command, args, env };
-}
-
 function writeGlobalAtlasConfig(patch: AtlasConfig) {
   const path = globalConfigPath();
   writeJson(path, { ...readJson(path), ...patch });
   return path;
 }
 
+/** The clients `--only a,b` names (ids from `targets()`), or all of them. */
+function chosenTargets() {
+  const only = arg("only")?.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const all = targets();
+  if (!only) return all;
+  const unknown = only.filter((id) => !all.some((t) => t.id === id));
+  if (unknown.length) throw new Error(`Unknown client: ${unknown.join(", ")}. Choose from: ${all.map((t) => t.id).join(", ")}`);
+  return all.filter((t) => only.includes(t.id));
+}
+
 /** Machine-wide IDE MCP configs only — never project-local files. */
 function writeGlobalAgentConfigs(baseUrl: string, token: string) {
-  const entry = stdioMcpEntry(baseUrl, token, "npx");
-  const vscodeEntry = vscodeMcpEntry(baseUrl, token);
-  const home = homedir();
-  const merge = (c: Record<string, unknown>, root: "mcpServers" | "servers", server: unknown) => ({
-    ...c,
-    [root]: { ...((c[root] as object) ?? {}), atlas: server },
-  });
-  const targets: { name: string; path: string; apply: (c: Record<string, unknown>) => Record<string, unknown> }[] = [
-    {
-      name: "Cursor (~/.cursor/mcp.json)",
-      path: join(home, ".cursor", "mcp.json"),
-      apply: (c) => merge(c, "mcpServers", entry),
-    },
-    {
-      name: "Claude Code (~/.claude.json)",
-      path: join(home, ".claude.json"),
-      apply: (c) => merge(c, "mcpServers", entry),
-    },
-    {
-      name: "Windsurf (~/.codeium/windsurf/mcp_config.json)",
-      path: join(home, ".codeium", "windsurf", "mcp_config.json"),
-      apply: (c) => merge(c, "mcpServers", entry),
-    },
-    {
-      name: "VS Code (User/mcp.json)",
-      path: vscodeUserMcpPath("Code"),
-      apply: (c) => merge(c, "servers", vscodeEntry),
-    },
-    {
-      name: "VS Code Insiders (User/mcp.json)",
-      path: vscodeUserMcpPath("Code - Insiders"),
-      apply: (c) => merge(c, "servers", vscodeEntry),
-    },
-    {
-      name: "GitHub Copilot CLI (~/.copilot/mcp-config.json)",
-      path: join(home, ".copilot", "mcp-config.json"),
-      apply: (c) => merge(c, "mcpServers", entry),
-    },
-  ];
-  for (const t of targets) {
-    try {
-      writeJson(t.path, t.apply(readJson(t.path)));
-      out(`  ✓ ${t.name}`);
-    } catch (e) {
-      out(`  · skipped ${t.name} (${(e as Error).message})`);
-    }
+  const entry = stdioEntry(baseUrl, token, "npx");
+  for (const t of chosenTargets()) {
+    const r = installTarget(t, entry);
+    out("why" in r ? `  · skipped ${t.name} — ${r.why}` : `  ✓ ${t.name}`);
   }
+}
+
+/** `atlas uninstall`: take the atlas server out of every client config (other servers stay). */
+function uninstall() {
+  for (const t of chosenTargets()) {
+    const r = removeTarget(t);
+    if (r === "removed") out(`  ✓ removed from ${t.name}`);
+    else if (r !== "absent" && "why" in r) out(`  · skipped ${t.name} — ${r.why}`);
+  }
+  out(`Done. A one-time .atlas-bak copy of each changed file sits beside it.`);
 }
 
 /** Optional: write repo-level .atlas override (does not touch IDE configs). */
@@ -219,7 +174,7 @@ async function ensureProjectLinked(baseUrl: string, key: string | undefined, pro
   return name;
 }
 
-async function globalInstall(opts: { cursorOnly?: boolean } = {}) {
+async function globalInstall() {
   const key = arg("key") || process.env.ATLAS_MCP_KEY;
   const baseUrl = (arg("base-url") || process.env.ATLAS_BASE_URL || "https://atlas.naravirtual.in").replace(/\/$/, "");
   const token = key?.trim() || "${ATLAS_MCP_KEY}";
@@ -233,16 +188,7 @@ async function globalInstall(opts: { cursorOnly?: boolean } = {}) {
 
   out(`\nGlobal Atlas MCP install (machine-wide, not per-repo):`);
 
-  if (opts.cursorOnly) {
-    const path = join(homedir(), ".cursor", "mcp.json");
-    const cfg = readJson(path) as { mcpServers?: Record<string, unknown> };
-    cfg.mcpServers ??= {};
-    cfg.mcpServers.atlas = stdioMcpEntry(baseUrl, token, "npx");
-    writeJson(path, cfg);
-    out(`  ✓ Cursor (~/.cursor/mcp.json)`);
-  } else {
-    writeGlobalAgentConfigs(baseUrl, token);
-  }
+  writeGlobalAgentConfigs(baseUrl, token);
 
   if (project) {
     const cfgPath = writeGlobalAtlasConfig({
@@ -257,7 +203,7 @@ async function globalInstall(opts: { cursorOnly?: boolean } = {}) {
 
   out(`Transport: npx → ${GITHUB_PKG_LATEST} (tools sync from server on each connect; localPath reads from workspace)`);
   if (!key) out(`Set ATLAS_MCP_KEY in your shell, or re-run with --key atlas_mcp_…`);
-  out(`Restart Cursor, Claude Code, Windsurf, VS Code, or Copilot CLI.\n`);
+  out(`Restart the AI clients above. Check everything with: atlas doctor\n`);
 }
 
 /** Optional per-repo override — does NOT touch IDE MCP configs (use install for that). */
@@ -354,8 +300,10 @@ function showHelp() {
   out(`atlas — connect your IDE to Atlas (global, one-time per machine)\n`);
   out(`Recommended (no global npm install):\n`);
   out(`  npx -y ${GITHUB_PKG} install --key atlas_mcp_… --project Nara`);
-  out(`    → Cursor, Claude Code, Windsurf, VS Code, Copilot CLI + ~/.atlas/config.json\n`);
-  out(`  npx -y ${GITHUB_PKG} cursor-install --key atlas_mcp_… --project Nara   Cursor only\n`);
+  out(`    → Cursor, Claude Code, Claude Desktop, Windsurf, VS Code, Copilot CLI, Codex CLI, Gemini CLI + ~/.atlas/config.json`);
+  out(`    --only cursor,codex   just those (ids: ${targets().map((t) => t.id).join(", ")})`);
+  out(`  atlas uninstall [--only …]   remove the atlas server from those clients`);
+  out(`  atlas doctor                 check key, connection, tools, prompts and which clients are wired up\n`);
   out(`Optional per-repo override (not required for MCP):\n`);
   out(`  atlas . [--project Name]   link repo; creates project if missing (uses folder name by default)`);
   out(`  npx -y ${GITHUB_PKG} bind --project foo   writes ./.atlas only\n`);
@@ -371,7 +319,11 @@ function showHelp() {
 (async () => {
   // `atlas .` or `atlas init` → scaffold .atlas + agent configs in the current folder
   if (cmd === "install") await globalInstall();
-  else if (cmd === "cursor-install" || (cmd === "cursor" && process.argv[3] === "install")) await globalInstall({ cursorOnly: true });
+  else if (cmd === "cursor-install" || (cmd === "cursor" && process.argv[3] === "install")) {
+    process.argv.push("--only", "cursor");
+    await globalInstall();
+  } else if (cmd === "uninstall") uninstall();
+  else if (cmd === "doctor") process.exitCode = await doctor();
   else if (cmd === "bind" || cmd === "." || cmd === "init" || cmd === "setup") {
     if (cmd === "." || cmd === "init" || cmd === "setup") await init();
     else await bindRepo();

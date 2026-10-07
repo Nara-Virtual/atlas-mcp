@@ -1,6 +1,6 @@
 {
   "name": "atlas-mcp",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Atlas MCP server — connect any AI coding agent (Cursor, Claude Code, Windsurf…) to your team's Atlas knowledge hub. Pull prompts/docs/secrets as context; passively capture what the AI builds.",
   "repository": {
     "type": "git",

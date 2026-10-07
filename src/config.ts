@@ -44,6 +44,12 @@ function readConfigFile(path: string): AtlasConfig {
   }
 }
 
+/** A key an app passed through unexpanded ("${ATLAS_MCP_KEY}") is not a key. */
+export function cleanKey(v: string | undefined): string | null {
+  const k = v?.trim();
+  return k && !k.includes("${") ? k : null;
+}
+
 export function loadConfig(): Resolved {
   const found = findDotAtlas();
   // Global first, optional repo .atlas overrides (most users only need global).
@@ -52,7 +58,7 @@ export function loadConfig(): Resolved {
 
   return {
     baseUrl: (process.env.ATLAS_BASE_URL || "https://atlas.naravirtual.in").replace(/\/$/, ""),
-    apiKey: process.env.ATLAS_MCP_KEY || process.env.ATLAS_API_KEY || null,
+    apiKey: cleanKey(process.env.ATLAS_MCP_KEY) ?? cleanKey(process.env.ATLAS_API_KEY),
     config,
     cwd: process.cwd(),
   };

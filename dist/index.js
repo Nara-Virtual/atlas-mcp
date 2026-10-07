@@ -2,11 +2,14 @@ import { readFile } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CompleteRequestSchema, GetPromptRequestSchema, ListPromptsRequestSchema, ListResourceTemplatesRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { AtlasClient } from "./client.js";
 /** Thin local bridge — tool catalog and handlers live on the Atlas server (auto-sync on every connect). */
-export const CLIENT_VERSION = "0.6.0";
+export const CLIENT_VERSION = "0.7.0";
+/** How often the tool list is re-read, so a server deploy shows up without restarting the IDE. */
+const MANIFEST_REFRESH_MS = 5 * 60_000;
 const dynamicInput = z.object({}).passthrough();
 // these span every project the key reaches (task tools take the project from the task itself)
 const NO_PROJECT_DEFAULT = new Set([
@@ -63,6 +66,69 @@ function toMcpContent(result) {
         content: [{ type: "text", text }, ...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }))],
     };
 }
+/**
+ * Prompts, resources and completions live on the remote endpoint; forwarding them here gives stdio-only clients
+ * (Claude Desktop, Codex, Gemini CLI…) the same MCP surface as a URL config. Every call is read-only and goes
+ * through the key, so scopes and per-item access apply on the server.
+ */
+export function registerRemoteHandlers(server, client) {
+    server.server.registerCapabilities({ prompts: { listChanged: false }, resources: { listChanged: false, subscribe: false }, completions: {} });
+    const forward = (method) => async (req) => (await client.rpc(method, req.params ?? {}));
+    const h = server.server.setRequestHandler.bind(server.server);
+    h(ListPromptsRequestSchema, forward("prompts/list"));
+    h(GetPromptRequestSchema, forward("prompts/get"));
+    h(ListResourcesRequestSchema, forward("resources/list"));
+    h(ListResourceTemplatesRequestSchema, forward("resources/templates/list"));
+    h(ReadResourceRequestSchema, forward("resources/read"));
+    h(CompleteRequestSchema, forward("completion/complete"));
+}
+/** The MCP server for one connection: the manifest's tools plus the remote prompts / resources / completions. */
+export function buildServer(client, manifest, boundRef, cwd) {
+    const server = new McpServer({ name: "atlas", version: manifest.version }, { instructions: manifest.instructions + (boundRef ? ` Bound project: ${boundRef}.` : "") });
+    const registered = new Map();
+    const sigOf = (t) => JSON.stringify([t.title, t.description, t.annotations]);
+    const add = (tool) => {
+        const reg = server.registerTool(tool.name, { title: tool.title, description: tool.description, inputSchema: dynamicInput, annotations: tool.annotations }, async (args) => {
+            try {
+                let resolved = withDefaultProject(args, boundRef, tool.name);
+                resolved = await resolveLocalPath(tool.name, resolved, cwd);
+                const out = await client.post("/api/v1/mcp/call", {
+                    name: tool.name,
+                    arguments: resolved,
+                });
+                if ("queued" in out)
+                    return toMcpContent("Queued — will flush when online.");
+                return toMcpContent(out.result);
+            }
+            catch (e) {
+                return { ...toMcpContent(e.message), isError: true };
+            }
+        });
+        registered.set(tool.name, { sig: sigOf(tool), tool: reg });
+    };
+    /** Make the registered tools match the manifest; connected clients are told the list changed. */
+    const syncTools = (tools) => {
+        const names = new Set(tools.map((t) => t.name));
+        for (const [name, r] of registered) {
+            if (!names.has(name)) {
+                r.tool.remove();
+                registered.delete(name);
+            }
+        }
+        for (const t of tools) {
+            const have = registered.get(t.name);
+            if (!have)
+                add(t);
+            else if (have.sig !== sigOf(t)) {
+                have.tool.update({ title: t.title, description: t.description, annotations: t.annotations });
+                have.sig = sigOf(t);
+            }
+        }
+    };
+    syncTools(manifest.tools);
+    registerRemoteHandlers(server, client);
+    return { server, syncTools };
+}
 export async function runServer() {
     const { baseUrl, apiKey, config, cwd } = loadConfig();
     if (!apiKey) {
@@ -70,9 +136,10 @@ export async function runServer() {
         process.exit(1);
     }
     const client = new AtlasClient(baseUrl, apiKey);
+    // fresh from Atlas when reachable; the last copy when it is not, so an IDE opened offline still has its tools
     let manifest;
     try {
-        manifest = await client.get("/api/v1/mcp/manifest", { cache: false });
+        manifest = await client.get("/api/v1/mcp/manifest", { cache: true, fresh: true });
     }
     catch (e) {
         log(`Could not load MCP manifest from ${baseUrl}: ${e.message}`);
@@ -91,26 +158,15 @@ export async function runServer() {
         }
     }
     log(`server MCP v${manifest.version} · client v${CLIENT_VERSION} · ${manifest.tools.length} tools · project=${boundRef ?? "none"}`);
-    const server = new McpServer({ name: "atlas", version: manifest.version }, { instructions: manifest.instructions + (boundRef ? ` Bound project: ${boundRef}.` : "") });
-    for (const tool of manifest.tools) {
-        server.registerTool(tool.name, { title: tool.title, description: tool.description, inputSchema: dynamicInput, annotations: tool.annotations }, async (args) => {
-            try {
-                let resolved = withDefaultProject(args, boundRef, tool.name);
-                resolved = await resolveLocalPath(tool.name, resolved, cwd);
-                const out = await client.post("/api/v1/mcp/call", {
-                    name: tool.name,
-                    arguments: resolved,
-                });
-                if ("queued" in out)
-                    return toMcpContent("Queued — will flush when online.");
-                return toMcpContent(out.result);
-            }
-            catch (e) {
-                return { ...toMcpContent(e.message), isError: true };
-            }
-        });
-    }
+    const { server, syncTools } = buildServer(client, manifest, boundRef, cwd);
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    log(`ready (cwd=${cwd}) — tools synced from server`);
+    // a deploy that adds or changes tools reaches this session within minutes, no restart
+    setInterval(() => {
+        client
+            .get("/api/v1/mcp/manifest", { cache: true, fresh: true })
+            .then((m) => syncTools(m.tools))
+            .catch(() => { });
+    }, MANIFEST_REFRESH_MS).unref();
+    log(`ready (cwd=${cwd}) — tools synced from server, prompts / resources / completions forwarded`);
 }

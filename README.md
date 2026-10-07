@@ -1,6 +1,6 @@
 # atlas-mcp
 
-Connect any AI coding agent (Cursor, Claude Code, Windsurf, VS Code/Copilot, Cline…) to your team's
+Connect any AI coding agent (Cursor, Claude Code, Claude Desktop, Codex, Gemini CLI, Windsurf, VS Code/Copilot, Cline…) to your team's
 **Atlas** knowledge hub. The agent pulls your approved prompts, docs and scoped secrets as context —
 and Atlas passively captures what the AI builds, so the team can see it without anyone using Jira.
 
@@ -22,6 +22,22 @@ npx -y github:Nara-Virtual/atlas-mcp#main update
 ```
 
 Pulls the latest commit from GitHub `main` (IDE `npx` configs from `atlas install` already use `#main`).
+
+## One-command install into your AI clients
+
+```bash
+atlas install --key atlas_mcp_… --project Nara     # every client below that you use
+atlas install --key atlas_mcp_… --only codex,gemini # just those
+atlas uninstall [--only cursor]                      # take atlas out again (other servers stay)
+atlas doctor                                         # check key, connection, tools, prompts, wired clients
+```
+
+Cursor, Claude Code, Claude Desktop, Windsurf, VS Code (+ Insiders), GitHub Copilot CLI, Codex CLI
+(`~/.codex/config.toml`) and Gemini CLI (`~/.gemini/settings.json`). Claude Desktop and Codex take the key
+literally (they cannot read your shell profile), so they need `--key`; the others use `${ATLAS_MCP_KEY}`.
+A config file that is not plain JSON (comments, a typo) is skipped and never rewritten; the first change to any
+file leaves a one-time `<file>.atlas-bak` copy. Zed and Cline keep JSONC settings — add the stdio entry by hand
+(`command: npx`, `args: ["-y", "github:Nara-Virtual/atlas-mcp#main"]`, `env: ATLAS_MCP_KEY`, `ATLAS_BASE_URL`).
 
 ## One-command setup
 
@@ -115,11 +131,16 @@ it always matches your key's toolsets:
 - **ops**: `atlas_uptime`, `atlas_logs`, `atlas_databases`, `atlas_deployments`, `atlas_server_usage`, `atlas_dokploy_api_search`, `atlas_dokploy_api_call` (reads); **deploy**: `atlas_deploy_action`, `atlas_dokploy_api_call` (operate / configure; destroy and instance-wide with "Allow Dokploy admin").
 - **inbox / team / mynotes / chat**: through `atlas_browse` / `atlas_read` / `atlas_write`, plus `atlas_chat_send`.
 
-MCP prompts (`work_on_task`, `my_day`, `ops_check`, your team's Prompt library), resources (`atlas://task|doc|code|image/{id}`)
-and completions are served by the remote endpoint (`<atlas>/api/mcp`) — use the URL config for those; this bridge
-carries the tools.
+MCP prompts (`work_on_task`, `my_day`, `ops_check`, your team's Prompt library), resources (`atlas://task|doc|code|image/{id}`),
+resource templates and completions are forwarded to the remote endpoint (`<atlas>/api/mcp`) with your key, so a
+stdio-only client has the same surface as a URL config. The tool list is re-read every 5 minutes: a server deploy
+adds or changes tools in an open session without restarting the IDE, and an IDE opened offline starts from the last
+copy of the manifest.
 
 ## How it works
+
+Calls time out after 30 s; reads retry once on a network failure or a 5xx, writes never repeat. Errors say what to do
+("key revoked → create a new MCP key", "rate limited — retry in 12 s").
 
 A thin, cached client over the Atlas REST API. Reads are served from a local cache
 (`~/.atlas/cache`, stale-while-revalidate) so they're instant and work offline; writes queue and flush
