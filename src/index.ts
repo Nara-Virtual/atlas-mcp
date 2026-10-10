@@ -8,6 +8,7 @@ import {
   ListPromptsRequestSchema,
   ListResourceTemplatesRequestSchema,
   ListResourcesRequestSchema,
+  ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -15,10 +16,11 @@ import { loadConfig } from "./config.js";
 import { AtlasClient } from "./client.js";
 
 /** Thin local bridge — tool catalog and handlers live on the Atlas server (auto-sync on every connect). */
-export const CLIENT_VERSION = "0.7.0";
+export const CLIENT_VERSION = "0.8.0";
 /** How often the tool list is re-read, so a server deploy shows up without restarting the IDE. */
 const MANIFEST_REFRESH_MS = 5 * 60_000;
 
+// calls are validated on the server; the schema the client SEES is the manifest's own (see the tools/list override)
 const dynamicInput = z.object({}).passthrough();
 // these span every project the key reaches (task tools take the project from the task itself)
 const NO_PROJECT_DEFAULT = new Set([
@@ -118,8 +120,8 @@ export function buildServer(client: AtlasClient, manifest: McpManifest, boundRef
     { instructions: manifest.instructions + (boundRef ? ` Bound project: ${boundRef}.` : "") },
   );
 
-  const registered = new Map<string, { sig: string; tool: RegisteredTool }>();
-  const sigOf = (t: ManifestTool) => JSON.stringify([t.title, t.description, t.annotations]);
+  const registered = new Map<string, { sig: string; tool: RegisteredTool; def: ManifestTool }>();
+  const sigOf = (t: ManifestTool) => JSON.stringify([t.title, t.description, t.annotations, t.inputSchema]);
   const add = (tool: ManifestTool) => {
     const reg = server.registerTool(
       tool.name,
@@ -139,7 +141,7 @@ export function buildServer(client: AtlasClient, manifest: McpManifest, boundRef
         }
       },
     );
-    registered.set(tool.name, { sig: sigOf(tool), tool: reg });
+    registered.set(tool.name, { sig: sigOf(tool), tool: reg, def: tool });
   };
 
   /** Make the registered tools match the manifest; connected clients are told the list changed. */
@@ -157,11 +159,27 @@ export function buildServer(client: AtlasClient, manifest: McpManifest, boundRef
       else if (have.sig !== sigOf(t)) {
         have.tool.update({ title: t.title, description: t.description, annotations: t.annotations });
         have.sig = sigOf(t);
+        have.def = t;
       }
     }
   };
 
   syncTools(manifest.tools);
+  // McpServer would list every tool with the empty passthrough schema, so clients sent arrays / numbers as strings
+  // (assigneeIds: "[…]") and the server refused them. List the manifest's real JSON Schema instead. Set after the
+  // first registerTool (which installs McpServer's handlers once); later syncs only update `registered`.
+  if (registered.size)
+    server.server.setRequestHandler(ListToolsRequestSchema, () => ({
+      tools: [...registered.entries()]
+        .filter(([, r]) => r.tool.enabled)
+        .map(([name, { def }]) => ({
+          name,
+          title: def.title,
+          description: def.description,
+          inputSchema: { type: "object" as const, ...def.inputSchema },
+          ...(def.annotations ? { annotations: def.annotations } : {}),
+        })),
+    }));
   registerRemoteHandlers(server, client);
   return { server, syncTools };
 }
